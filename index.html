@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Real-Time Multilingual Transcription Service</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; padding: 40px; background-color: #f4f7f6; }
+        .container { max-width: 800px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1 { color: #333; }
+        #output { border: 2px solid #ccc; min-height: 120px; padding: 15px; margin-top: 20px; text-align: left; background-color: #e9eef2; border-radius: 5px; font-size: 1.1em; }
+        .transcript-line { margin: 5px 0; border-bottom: 1px dashed #c0c0c0; padding-bottom: 5px; color: #1a1a1a; }
+        #status { font-weight: bold; margin-top: 15px; }
+        .recording { color: #d9534f; }
+        .ready { color: #5cb85c; }
+        button { padding: 12px 25px; font-size: 18px; cursor: pointer; border: none; border-radius: 5px; transition: background-color 0.3s; }
+        #recordButton.start { background-color: #5cb85c; color: white; }
+        #recordButton.start:hover { background-color: #4cae4c; }
+        #recordButton.stop { background-color: #d9534f; color: white; }
+        #recordButton.stop:hover { background-color: #c9302c; }
+        #recordButton:disabled { background-color: #ccc; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 Real-Time Multilingual STT</h1>
+        <p>Click the button, speak a sentence in Hindi, English, or a mixture (Hinglish), and click again to transcribe.</p>
+        
+        <button id="recordButton" class="start" disabled>Connect...</button>
+        <p id="status">Status: Connecting to service...</p>
+
+        <h2>Transcription Output</h2>
+        <div id="output"></div>
+    </div>
+
+    <script>
+        // --- Configuration ---
+        const WS_URL = "ws://localhost:8000/ws/stt"; // MUST match the backend port and path
+        const CHUNK_SIZE = 4096; // Audio chunk size for streaming
+        const SAMPLE_RATE = 16000; // Whisper requires 16kHz
+        // ---------------------
+
+        let socket;
+        let audioContext;
+        let mediaStreamSource;
+        let processor;
+        let stream;
+        let isRecording = false;
+
+        const recordButton = document.getElementById('recordButton');
+        const statusElement = document.getElementById('status');
+        const outputElement = document.getElementById('output');
+
+        // Function to establish and manage the WebSocket connection
+        function connectWebSocket() {
+            socket = new WebSocket(WS_URL);
+
+            socket.onopen = () => {
+                statusElement.className = "ready";
+                statusElement.textContent = "Status: Connected. Click to start speaking.";
+                recordButton.disabled = false;
+                recordButton.textContent = "Start Speaking";
+            };
+
+            socket.onmessage = (event) => {
+                const message = event.data;
+                
+                if (message === "__END_OF_TRANSCRIPT__") {
+                    statusElement.className = "ready";
+                    statusElement.textContent = "Status: Connected. Transcription done. Click to speak again.";
+                    recordButton.disabled = false;
+                    recordButton.textContent = "Start Speaking";
+                    recordButton.className = "start";
+                } else {
+                    // Receive the partial or full transcription from the server
+                    const line = document.createElement('div');
+                    line.className = 'transcript-line';
+                    line.textContent = message;
+                    outputElement.prepend(line);
+                    console.log("Transcription received:", message);
+                }
+            };
+
+            socket.onclose = () => {
+                statusElement.className = "";
+                statusElement.textContent = "Status: Disconnected. Try reloading the page or checking the server.";
+                recordButton.disabled = true;
+                isRecording = false;
+            };
+
+            socket.onerror = (error) => {
+                statusElement.textContent = `Status: Error - ${error.message}`;
+                console.error("WebSocket Error:", error);
+                socket.close();
+            };
+        }
+
+        // Handles the recording process
+        function toggleRecording() {
+            if (isRecording) {
+                // STOPPING
+                isRecording = false;
+                recordButton.textContent = "Processing...";
+                recordButton.disabled = true;
+                statusElement.textContent = "Status: Sending audio and waiting for transcription...";
+                
+                // 1. Stop mic stream and disconnect nodes
+                if (processor) processor.disconnect();
+                if (mediaStreamSource) mediaStreamSource.disconnect();
+                if (stream) stream.getTracks().forEach(track => track.stop());
+
+                // 2. Send the end signal to the server
+                if (socket.readyState === WebSocket.OPEN) {
+                    // Send a specific byte sequence to signal end of speech
+                    socket.send(new TextEncoder().encode('END_STREAM').buffer);
+                } else {
+                    console.error("WebSocket not open for END_STREAM.");
+                }
+                
+            } else {
+                // STARTING
+                isRecording = true;
+                recordButton.className = "stop";
+                recordButton.textContent = "Stop Speaking";
+                statusElement.className = "recording";
+                statusElement.textContent = "Status: Recording and Streaming...";
+                outputElement.innerHTML = ''; // Clear previous output
+
+                // 1. Get microphone access
+                navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        sampleRate: SAMPLE_RATE, 
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    } 
+                })
+                .then(userStream => {
+                    stream = userStream;
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                    mediaStreamSource = audioContext.createMediaStreamSource(stream);
+                    
+                    // 2. Create Audio Processor Node
+                    // Note: ScriptProcessorNode is deprecated, but simpler than AudioWorklet for this demo.
+                    processor = audioContext.createScriptProcessor(CHUNK_SIZE, 1, 1);
+                    
+                    processor.onaudioprocess = (e) => {
+                        if (!isRecording || socket.readyState !== WebSocket.OPEN) return;
+
+                        // Get the raw audio data (Float32Array)
+                        const input = e.inputBuffer.getChannelData(0);
+                        
+                        // Convert Float32 to 16-bit PCM (Int16Array)
+                        const buffer = new ArrayBuffer(input.length * 2);
+                        const view = new DataView(buffer);
+                        for (let i = 0; i < input.length; i++) {
+                            // Scale up to 16-bit max value (32767)
+                            view.setInt16(i * 2, input[i] * 32767, true); 
+                        }
+                        
+                        // 3. Send the raw 16-bit PCM data to the server
+                        socket.send(buffer);
+                    };
+
+                    // 4. Connect nodes
+                    mediaStreamSource.connect(processor);
+                    processor.connect(audioContext.destination);
+
+                })
+                .catch(err => {
+                    console.error("Error accessing microphone:", err);
+                    statusElement.textContent = `Status: Microphone access denied or error: ${err.name}.`;
+                    isRecording = false;
+                    recordButton.textContent = "Start Speaking";
+                    recordButton.className = "start";
+                });
+            }
+        }
+
+        recordButton.addEventListener('click', toggleRecording);
+        
+        // Initial connection attempt when the page loads
+        connectWebSocket();
+    </script>
+</body>
+</html>
